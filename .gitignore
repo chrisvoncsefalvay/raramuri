@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+profiles/gb10/runs/
+profiles/b200/runs/
+*.prof
+*.pkl
+.runtime
+.venv*
+.gsd
+.bg-shell
