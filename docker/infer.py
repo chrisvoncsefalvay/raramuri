@@ -1263,6 +1263,7 @@ def download_video(
     t0 = time.monotonic()
     command = [
         "yt-dlp",
+        "--remote-components", "ejs:github",
         "-f", "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best",
         "--merge-output-format", "mp4",
         "-o", str(output_path),
@@ -1585,6 +1586,15 @@ def run_inference(video_path: str, progress_callback: Callable[[dict], None] | N
     logger.info("CUDA device: %s", torch.cuda.get_device_name(0))
     logger.info("VRAM: %.1f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
     logger.info("Torch runtime: version=%s cuda=%s", torch.__version__, torch.version.cuda)
+
+    # On unified-memory hardware (DGX Spark / GB10) GPU and system RAM are the
+    # same physical pool.  Without a cap, model loading can exhaust the pool and
+    # OOM-kill the container.  70% leaves headroom for the OS and CPU-side work
+    # (NeMo/Parakeet runs on CPU).  Override via RARAMURI_VRAM_FRACTION if a
+    # different deployment target needs a different ceiling.
+    _vram_fraction = float(os.environ.get("RARAMURI_VRAM_FRACTION", "0.70"))
+    torch.cuda.set_per_process_memory_fraction(_vram_fraction)
+    logger.info("VRAM fraction cap: %.0f%%", _vram_fraction * 100)
 
     # --- Load model ---
     step_index = phase_order.index("model_load") + 1

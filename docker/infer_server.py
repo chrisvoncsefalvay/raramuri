@@ -105,6 +105,7 @@ class JobRecord:
     output_path: str | None = None
     result_shape: list | None = None
     result: dict | None = None
+    video_file: str | None = None
     cancel_requested: bool = False
     future: concurrent.futures.Future | None = field(default=None, repr=False)
 
@@ -568,6 +569,12 @@ class InferenceService:
                     job.result_shape = result.get("shape")
                     job.completed_at = _utc_now_iso()
                     job.updated_at = job.completed_at
+                    # Preserve video file for client download
+                    if cleanup_dir is not None and prepared_video_path.exists():
+                        video_dest = Path(tempfile.mkdtemp(prefix="raramuri-video-")) / f"{job_id}.mp4"
+                        import shutil as _shutil2
+                        _shutil2.copy2(str(prepared_video_path), str(video_dest))
+                        job.video_file = str(video_dest)
                 self._current_request = None
             return result
         except Exception as exc:
@@ -769,7 +776,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(file_size))
-        self.send_header("Content-Disposition", f'attachment; filename="{fpath.name}"')
+        if content_type.startswith("video/"):
+            self.send_header("Content-Disposition", f'inline; filename="{fpath.name}"')
+        else:
+            self.send_header("Content-Disposition", f'attachment; filename="{fpath.name}"')
         self.end_headers()
         with open(fpath, "rb") as f:
             while chunk := f.read(65536):
@@ -822,6 +832,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/metrics":
             self._send_text(200, self.service.metrics_payload())
             return
+        if path == "/jobs":
+            with self.service._lock:
+                jobs = []
+                for jid, jr in self.service._jobs.items():
+                    jobs.append({
+                        "job_id": jr.job_id,
+                        "status": jr.status,
+                        "phase": jr.phase,
+                        "submitted_at": jr.submitted_at,
+                        "completed_at": jr.completed_at,
+                        "result_shape": jr.result_shape,
+                        "has_video": jr.video_file is not None and Path(jr.video_file).exists(),
+                        "input": {k: v for k, v in jr.request.items() if k != "output"},
+                    })
+            self._send_json(200, {"jobs": jobs})
+            return
         if path.startswith("/jobs/"):
             parts = [part for part in path.split("/") if part]
             if len(parts) == 2 and parts[0] == "jobs":
@@ -838,6 +864,22 @@ class Handler(BaseHTTPRequestHandler):
                     payload = self.service.get_job_result(parts[1])
                     payload.update(self._job_urls(parts[1]))
                     self._send_json(200, payload)
+                    return
+                except APIError as exc:
+                    self._send_error(exc.status, exc.code, exc.message)
+                    return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "video":
+                try:
+                    job = self.service.get_job(parts[1])
+                    video_file = job.get("video_file") if isinstance(job, dict) else None
+                    if video_file is None:
+                        with self.service._lock:
+                            jr = self.service._jobs.get(parts[1])
+                            video_file = jr.video_file if jr else None
+                    if video_file and Path(video_file).exists():
+                        self._send_file(video_file, content_type="video/mp4")
+                        return
+                    self._send_error(404, "video_not_found", "Video file not available for this job")
                     return
                 except APIError as exc:
                     self._send_error(exc.status, exc.code, exc.message)
