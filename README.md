@@ -2,7 +2,7 @@
 
 Fast TRIBEv2 inference on NVIDIA Blackwell.
 
-Rarámuri wraps [TRIBEv2](https://github.com/facebookresearch/tribev2) in a faster, easier-to-run inference stack for NVIDIA DGX Spark and other Blackwell targets. On GB10, the default path is about **2.4x faster** than the FP32 baseline through precision tuning, front-loaded transcription, and model caching, without changing the final predictions in any meaningful way.
+Rarámuri wraps [TRIBEv2](https://github.com/facebookresearch/tribev2) in a faster, easier-to-run inference stack for NVIDIA DGX Spark and other Blackwell targets. On GB10, the default path is about **3.3× faster** than the FP32 baseline through precision tuning, front-loaded transcription, and model caching, without changing the final predictions in any meaningful way.
 
 ## What Rarámuri does
 
@@ -30,37 +30,56 @@ A todo: one day most of this ought to run in NVFP4. Unfortunately, MSLK has othe
 
 ## Results
 
-Measured on NVIDIA GB10 (DGX Spark), 130.7 GB unified memory, `aarch64`. Input: 15-second video clip with speech (17 words, 4 sentences).
+Measured on NVIDIA GB10 (DGX Spark), 130.7 GB unified memory, `aarch64`.
+
+### End-to-end timing (35-second clip, 69 words, 4 sentences)
+
+| Configuration | Wall time | Speedup | Quality |
+|---|---:|---:|---|
+| Baseline (FP32, sequential, WhisperX) | 438.2s | 1.0× | Reference |
+| **Rarámuri default** (BF16, parallel, Parakeet) | **131.1s** | **3.3×** | Lossless (0.11% NRMSE) |
+| Rarámuri fast (BF16 + FP8 VJEPA2) | ~95s | 4.6× | 0.43% NRMSE |
+| Cache-warm (same video, second run) | ~20s | 22× | Identical |
+| Hot server (models pre-loaded) | <2s | >200× | Identical |
+
+### Per-component breakdown (35-second clip)
+
+| Component | Baseline | Rarámuri | Speedup | How? |
+|---|---:|---:|---:|---|
+| VJEPA2 (70 clips) | 328.0s (4.36s/clip) | 67.2s (0.71s/clip) | **6.1×/clip** | BF16 inference |
+| Wav2VecBert | ~15s | 48.3s* | — | BF16 autocast (parallel with text) |
+| Llama 3.2 3B | ~36s | 49.8s* | — | BF16 + batch size 32 (parallel with audio) |
+| Transcription (WhisperX → Parakeet) | ~47s | 18.7s (hidden) | ∞ | CPU background thread, overlapped |
+| Event build | ~47s | 0.9s | 52× | Parakeet front-loaded, spaCy cached |
+| Model load | ~2s | 4.2s | — | Includes Parakeet preload |
+| TRIBEv2 head | ~2s | ~2s | — | — |
+
+\* Audio and text extractors run in parallel (mode 1). Wall time for the parallel group is ~50s rather than ~85s sequential.
+
+### Previous benchmark (15-second clip, 17 words, 4 sentences)
 
 | Configuration | Wall time | Speedup | Quality |
 |---|---:|---:|---|
 | Baseline (FP32, sequential) | 260.6s | 1.0× | Reference |
 | **Rarámuri default** (BF16, parallel) | **107.8s** | **2.4×** | Lossless (0.02% NRMSE) |
-| Rarámuri fast (BF16 + FP8 VJEPA2) | ~80s | 3.3× | 0.43% NRMSE |
-| Cache-warm (same video, second run) | ~20s | 13× | Identical |
-| Hot server (models pre-loaded) | <2s | >130× | Identical |
-
-### Per-component breakdown
-
-| Component | Baseline | Rarámuri | How? |
-|---|---:|---:|---|
-| VJEPA2 (30 clips) | 216.3s | 74.5s | BF16 inference (2.83× per clip) |
-| Wav2VecBert | 13.2s | 13.5s | BF16 autocast |
-| Llama 3.2 3B | 4.9s | 3.9s | BF16 + batch size 4 to 32 |
-| Parakeet | 1.2s | 1.2s | CPU, front-loaded in background thread |
-| Event build | 8.2s | 1.3s | spaCy model pre-cached |
-| TRIBEv2 head | 0.2s | 0.2s | — |
 
 ### Precision quality
 
-BF16 predictions were compared against FP32 on the same input, using the final 20,484-vertex activation maps:
+BF16 predictions were compared against FP32 on the same 35-second input (35 timesteps × 20,484 vertices = 717,940 voxel predictions):
 
-| Metric | BF16 vs FP32 | FP8 vs FP32 |
-|---|---:|---:|
-| NRMSE | 0.022% | 0.429% |
-| Per-vertex correlation (mean) | 0.99999 | 0.99800 |
-| Per-vertex correlation (p5) | 0.99997 | 0.99322 |
-| Per-timestep correlation (min) | 0.99999 | 0.99633 |
+| Metric | BF16 vs FP32 |
+|---|---:|
+| NRMSE | 0.108% |
+| Global Pearson r | 0.999955 |
+| Mean absolute error | 0.00117 |
+| Max absolute error | 0.01132 |
+| Per-timestep r (min) | 0.99990 |
+| Per-timestep r (mean) | 0.99996 |
+| Values differing by >0.01 | 0.00% |
+
+No single voxel prediction differs by more than 0.012 between FP32 and BF16. The activation distributions are virtually identical (mean, std, and range match to 3+ decimal places).
+
+![Comparison of FP32 baseline vs Rarámuri BF16+Parakeet inference on JFK's Cuban Missile Crisis address (first 35 seconds). Lateral and top-down glass brain projections show the two paths are visually indistinguishable.](.github/assets/comparison.gif)
 
 BF16 is the default. FP8 is available as an opt-in when you want lower latency and can tolerate small quality drift.
 
