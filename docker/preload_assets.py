@@ -54,11 +54,21 @@ def _preload_nltk() -> list[str]:
     return loaded
 
 
-def _preload_mne() -> str:
+def _preload_mne() -> dict:
     import mne
 
     mne.set_config("MNE_DATA", str(MNE_DATA))
-    return str(_timed("MNE fsaverage", lambda: mne.datasets.fetch_fsaverage(verbose=True)))
+    fsaverage_dir = str(_timed("MNE fsaverage", lambda: mne.datasets.fetch_fsaverage(verbose=True)))
+
+    # Pre-fetch the HCP MMP parcellation annotations so they are never
+    # downloaded at inference time.  These are the ~1.3 MB lh/rh annot files
+    # that get_hcp_labels() needs for the metrics phase.
+    _timed(
+        "MNE HCP MMP parcellation",
+        lambda: mne.datasets.fetch_hcp_mmp_parcellation(verbose=True),
+    )
+
+    return {"fsaverage": fsaverage_dir, "hcp_mmp": True}
 
 
 def main() -> int:

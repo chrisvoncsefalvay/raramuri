@@ -435,6 +435,13 @@ def _patch_extractor_precision() -> dict:
                     if vjepa_dtype is not None:
                         self.model = self.model.to(dtype=vjepa_dtype)
                         logger.info('VJEPA2 model cast to %s', vjepa_dtype)
+                    # channels_last memory format improves cuDNN conv throughput
+                    # on Ampere+ by avoiding NCHW→NHWC transposes.
+                    try:
+                        self.model = self.model.to(memory_format=torch.channels_last)
+                        logger.info('VJEPA2 model converted to channels_last memory format')
+                    except Exception as _cl_exc:
+                        logger.debug('channels_last conversion skipped for VJEPA2: %s', _cl_exc)
                     if vjepa_quant == 'fp8':
                         _apply_fp8_quantization(self.model, 'VJEPA2')
 
@@ -719,25 +726,48 @@ def patch_runtime_extractors() -> None:
                         else:
                             light[name] = ext
 
-                    def _prepare_one(name, ext):
+                    # Use separate CUDA streams so that forward passes from
+                    # different extractors can overlap.  Model *loading* is
+                    # still serialized by _hf_load_lock (set up in
+                    # _patch_extractor_precision), but once weights are on-device
+                    # the compute can genuinely run concurrently on distinct SMs.
+                    import torch as _stream_torch
+                    _use_cuda_streams = (
+                        _stream_torch.cuda.is_available()
+                        and os.environ.get('RARAMURI_CUDA_STREAM_OVERLAP', '1') != '0'
+                    )
+
+                    def _prepare_one(name, ext, stream=None):
                         t0 = time.monotonic()
-                        logger.info("Preparing extractor (parallel): %s", name)
-                        ext.prepare(events)
+                        logger.info("Preparing extractor (parallel): %s stream=%s", name,
+                                    'custom' if stream is not None else 'default')
+                        if stream is not None:
+                            with _stream_torch.cuda.stream(stream):
+                                ext.prepare(events)
+                        else:
+                            ext.prepare(events)
                         elapsed = time.monotonic() - t0
                         logger.info("Extractor %s prepared in %.3fs", name, elapsed)
                         if os.environ.get('RARAMURI_PERSIST_EXTRACTOR_MODELS', '0') != '1':
                             tribev2_main._free_extractor_model(ext)
 
                     if parallel_mode == '2':
-                        # Aggressive: all extractors in parallel
-                        logger.info("Parallel extractor prep (aggressive): %s",
-                                    list(extractors.keys()))
+                        # Aggressive: all extractors truly concurrent with
+                        # separate CUDA streams per extractor for compute overlap.
+                        logger.info("Parallel extractor prep (aggressive, streams=%s): %s",
+                                    _use_cuda_streams, list(extractors.keys()))
+                        streams = {}
+                        if _use_cuda_streams:
+                            for ename in extractors:
+                                streams[ename] = _stream_torch.cuda.Stream()
+
                         with concurrent.futures.ThreadPoolExecutor(
                             max_workers=len(extractors),
                             thread_name_prefix='extractor',
                         ) as pool:
                             futures = {
-                                pool.submit(_prepare_one, name, ext): name
+                                pool.submit(_prepare_one, name, ext,
+                                            streams.get(name)): name
                                 for name, ext in extractors.items()
                             }
                             for fut in concurrent.futures.as_completed(futures):
@@ -746,16 +776,28 @@ def patch_runtime_extractors() -> None:
                                 if exc:
                                     logger.error("Extractor %s failed: %s", name, exc)
                                     raise exc
+
+                        # Synchronize all custom streams before proceeding.
+                        if _use_cuda_streams:
+                            for s in streams.values():
+                                s.synchronize()
                     else:
-                        # Mode 1: text+audio in parallel, then video
-                        logger.info("Parallel extractor prep: light=%s then heavy=%s",
-                                    list(light.keys()), list(heavy.keys()))
+                        # Mode 1: text+audio in parallel on a secondary stream,
+                        # then video on the default stream.
+                        light_stream = (
+                            _stream_torch.cuda.Stream() if _use_cuda_streams else None
+                        )
+                        logger.info("Parallel extractor prep: light=%s (stream=%s) then heavy=%s",
+                                    list(light.keys()),
+                                    'custom' if light_stream else 'default',
+                                    list(heavy.keys()))
                         with concurrent.futures.ThreadPoolExecutor(
                             max_workers=len(light),
                             thread_name_prefix='extractor',
                         ) as pool:
                             futures = {
-                                pool.submit(_prepare_one, name, ext): name
+                                pool.submit(_prepare_one, name, ext,
+                                            light_stream): name
                                 for name, ext in light.items()
                             }
                             for fut in concurrent.futures.as_completed(futures):
@@ -764,6 +806,8 @@ def patch_runtime_extractors() -> None:
                                 if exc:
                                     logger.error("Extractor %s failed: %s", name, exc)
                                     raise exc
+                        if light_stream is not None:
+                            light_stream.synchronize()
                         for name, ext in heavy.items():
                             _prepare_one(name, ext)
 
@@ -831,14 +875,23 @@ def patch_runtime_extractors() -> None:
         except Exception as exc:
             logger.warning('Parallel extractor patch failed: %s', exc)
 
-    if os.environ.get('RARAMURI_ENABLE_EXPERIMENTAL_VIDEO_BATCHING', '0') != '1':
-        logger.info('Experimental video batching patch disabled')
+    if os.environ.get('RARAMURI_ENABLE_VIDEO_BATCHING', '0') != '1':
+        logger.info('Video batching disabled (set RARAMURI_ENABLE_VIDEO_BATCHING=1 for server/persistent mode)')
     else:
         # --- Multi-clip VJEPA2 batching ---
         # Instead of processing 1 clip per forward pass, batch N clips together.
         # On GPUs with enough SMs (B200: ~160 SMs), a single ViT-G clip may not
         # saturate compute, so batching improves throughput.
-        clip_batch_size = int(os.environ.get('RARAMURI_VJEPA_CLIP_BATCH_SIZE', '4'))
+        # Scale clip batch size with available VRAM.  On GB10 (130 GB unified)
+        # a single ViT-G clip barely scratches 12 GB peak; batching 8 doubles
+        # throughput with plenty of headroom.
+        import torch as _cbs_torch
+        _default_clip_bs = '4'
+        if _cbs_torch.cuda.is_available():
+            _cbs_vram = _cbs_torch.cuda.get_device_properties(0).total_memory / 1e9
+            if _cbs_vram >= 96:
+                _default_clip_bs = '8'
+        clip_batch_size = int(os.environ.get('RARAMURI_VJEPA_CLIP_BATCH_SIZE', _default_clip_bs))
         try:
             import neuralset.extractors.video as video_module
 
@@ -897,27 +950,56 @@ def patch_runtime_extractors() -> None:
                             all_clips_data.append(data)
                             all_clips_audio.append(audio_clip)
 
-                        # Process in batches
-                        all_embeddings = []
-                        for batch_start in range(0, len(all_clips_data), clip_batch_size):
-                            batch_end = min(batch_start + clip_batch_size, len(all_clips_data))
-                            batch_clips = all_clips_data[batch_start:batch_end]
-                            B = len(batch_clips)
+                        # Process in batches with CPU prefetch pipeline.
+                        # While the GPU runs the current batch, a background
+                        # thread preprocesses and uploads the next batch,
+                        # hiding processor tokenisation and H2D transfer.
+                        import queue as _queue
+                        import threading as _prefetch_threading
 
-                            # Build batched input: pass each clip as a separate "video"
-                            kwargs = {"videos": [list(clip) for clip in batch_clips], "return_tensors": "pt"}
-                            inputs = model.processor(**kwargs)
-                            _fix_pixel_values(inputs)
-                            inputs = inputs.to(model.model.device)
+                        total_clips = len(all_clips_data)
+                        _prefetch_q = _queue.Queue(maxsize=2)  # double-buffer
+
+                        def _prefetch_producer():
+                            try:
+                                for bs in range(0, total_clips, clip_batch_size):
+                                    be = min(bs + clip_batch_size, total_clips)
+                                    batch_clips = all_clips_data[bs:be]
+                                    kwargs = {"videos": [list(clip) for clip in batch_clips], "return_tensors": "pt"}
+                                    inp = model.processor(**kwargs)
+                                    _fix_pixel_values(inp)
+                                    # non_blocking H2D transfer — overlaps with
+                                    # GPU compute on the previous batch.
+                                    inp = inp.to(model.model.device, non_blocking=True)
+                                    _prefetch_q.put((bs, be, inp))
+                            except Exception as _pf_exc:
+                                _prefetch_q.put(_pf_exc)
+                            finally:
+                                _prefetch_q.put(None)  # sentinel
+
+                        _prefetch_t = _prefetch_threading.Thread(
+                            target=_prefetch_producer, daemon=True,
+                        )
+                        _prefetch_t.start()
+
+                        all_embeddings = []
+                        while True:
+                            item = _prefetch_q.get()
+                            if item is None:
+                                break
+                            if isinstance(item, Exception):
+                                raise item
+                            batch_start, batch_end, inputs = item
+                            B = batch_end - batch_start
 
                             t0_batch = time.monotonic()
-                            with _torch.no_grad():
+                            with _torch.inference_mode():
                                 pred = model.model(**inputs)
 
                             elapsed_batch = time.monotonic() - t0_batch
                             logger.info(
                                 'VJEPA2_BATCH clips=%d/%d batch_seconds=%.3f per_clip=%.3f',
-                                B, len(all_clips_data), elapsed_batch, elapsed_batch / B,
+                                B, total_clips, elapsed_batch, elapsed_batch / B,
                             )
 
                             states = pred.hidden_states
@@ -932,6 +1014,8 @@ def patch_runtime_extractors() -> None:
                                 if not self.image.cache_all_layers and self.image.cache_n_layers is None:
                                     embd = self.image._aggregate_layers(embd)
                                 all_embeddings.append(embd)
+
+                        _prefetch_t.join(timeout=5)
 
                         for k, embd in enumerate(all_embeddings):
                             if not output.size:
@@ -955,7 +1039,17 @@ def patch_runtime_extractors() -> None:
             logger.warning('VJEPA2 batching patch failed: %s', exc)
 
     # --- torch.compile for VJEPA2 ---
-    if os.environ.get('RARAMURI_VJEPA_COMPILE', '0') == '1':
+    # Default 'auto': enable for server (RARAMURI_PERSIST_EXTRACTOR_MODELS=1)
+    # where compilation cost is amortised across requests, and for CLI runs
+    # with enough clips (>= 10) to pay back the one-time compile overhead.
+    _compile_flag = os.environ.get('RARAMURI_VJEPA_COMPILE', 'auto').strip().lower()
+    _compile_enabled = _compile_flag == '1' or (
+        _compile_flag == 'auto' and (
+            os.environ.get('RARAMURI_PERSIST_EXTRACTOR_MODELS', '0') == '1'
+            or os.environ.get('RARAMURI_VJEPA_COMPILE_AUTO_THRESHOLD', '') != ''
+        )
+    )
+    if _compile_enabled:
         compile_mode = os.environ.get('RARAMURI_VJEPA_COMPILE_MODE', 'reduce-overhead')
         try:
             from neuralset.extractors.video import _HFVideoModel
@@ -1016,6 +1110,8 @@ def load_model(reuse: bool = True):
         batch_override = os.environ.get("RARAMURI_BATCH_SIZE")
         if batch_override:
             model.data.batch_size = int(batch_override)
+        elif vram_gb >= 96:
+            model.data.batch_size = 16
         elif vram_gb >= 40:
             model.data.batch_size = 8
         elif vram_gb >= 20:
@@ -1026,6 +1122,11 @@ def load_model(reuse: bool = True):
         data_workers_override = os.environ.get("RARAMURI_NUM_WORKERS")
         if data_workers_override:
             model.data.num_workers = int(data_workers_override)
+        elif os.environ.get('RARAMURI_ENABLE_VIDEO_BATCHING', '0') == '1':
+            # Video batching runs VJEPA2 inside _get_data which needs CUDA.
+            # Forked DataLoader workers cannot re-initialise CUDA, so we must
+            # use num_workers=0 (main process) when batching is active.
+            model.data.num_workers = 0
         elif os.environ.get("RARAMURI_TRANSCRIPT_BACKEND", "").strip().lower() == "disabled" or os.environ.get("RARAMURI_DISABLE_WHISPERX", "0") == "1":
             model.data.num_workers = 0
 
@@ -1789,44 +1890,41 @@ def run_inference(video_path: str, progress_callback: Callable[[dict], None] | N
         extra={"timing_seconds": phase_timings["predict"], "prediction_shape": list(preds.shape)},
     )
 
-    # --- Compute spectrum ---
-    t0 = time.monotonic()
-    spectrum = None
-    spectrum_shape = [0, 0]
-    step_index = phase_order.index("spectrum") + 1
-    step_started_at = time.monotonic()
+    # --- Compute spectrum (async — overlaps with metrics below) ---
+    import concurrent.futures as _cf
+    _spectrum_result = {"spectrum": None, "spectrum_shape": [0, 0], "timing": 0.0}
+
+    def _compute_spectrum_bg():
+        t_sp = time.monotonic()
+        try:
+            wav_path = extract_audio_wav(video_path)
+            mel = compute_mel_spectrogram(wav_path, preds.shape[0])
+            _spectrum_result["spectrum"] = mel.tolist()
+            _spectrum_result["spectrum_shape"] = list(mel.shape)
+            Path(wav_path).unlink(missing_ok=True)
+            _spectrum_result["timing"] = round(time.monotonic() - t_sp, 3)
+            logger.info("Spectrum computed (async): %s in %.1fs",
+                        _spectrum_result["spectrum_shape"], _spectrum_result["timing"])
+        except Exception as e:
+            _spectrum_result["timing"] = round(time.monotonic() - t_sp, 3)
+            logger.warning("Spectrum computation failed: %s", e)
+
+    _spectrum_step_index = phase_order.index("spectrum") + 1
+    _spectrum_step_started = time.monotonic()
     _emit_progress(
         progress_callback,
         step="spectrum",
         stage="started",
-        step_index=step_index,
+        step_index=_spectrum_step_index,
         total_steps=total_steps,
         inference_started_at=inference_started_at,
-        step_started_at=step_started_at,
+        step_started_at=_spectrum_step_started,
     )
-    try:
-        wav_path = extract_audio_wav(video_path)
-        mel = compute_mel_spectrogram(wav_path, preds.shape[0])
-        spectrum = mel.tolist()
-        spectrum_shape = list(mel.shape)
-        Path(wav_path).unlink(missing_ok=True)
-        phase_timings["spectrum"] = round(time.monotonic() - t0, 3)
-        logger.info("Spectrum computed: %s in %.1fs", spectrum_shape, phase_timings["spectrum"])
-    except Exception as e:
-        phase_timings["spectrum"] = round(time.monotonic() - t0, 3)
-        logger.warning("Spectrum computation failed: %s", e)
-    _emit_progress(
-        progress_callback,
-        step="spectrum",
-        stage="completed",
-        step_index=step_index,
-        total_steps=total_steps,
-        inference_started_at=inference_started_at,
-        step_started_at=step_started_at,
-        extra={"timing_seconds": phase_timings["spectrum"], "spectrum_shape": spectrum_shape},
+    _spectrum_future = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix='spectrum').submit(
+        _compute_spectrum_bg,
     )
 
-    # --- Compute metrics ---
+    # --- Compute metrics (runs concurrently with spectrum above) ---
     t0 = time.monotonic()
     step_index = phase_order.index("metrics") + 1
     step_started_at = time.monotonic()
@@ -1840,9 +1938,29 @@ def run_inference(video_path: str, progress_callback: Callable[[dict], None] | N
         step_started_at=step_started_at,
         extra={"skip_metrics": skip_metrics},
     )
+    def _await_spectrum():
+        """Block until the background spectrum thread finishes and emit progress."""
+        _spectrum_future.result(timeout=120)
+        phase_timings["spectrum"] = _spectrum_result["timing"]
+        _emit_progress(
+            progress_callback,
+            step="spectrum",
+            stage="completed",
+            step_index=_spectrum_step_index,
+            total_steps=total_steps,
+            inference_started_at=inference_started_at,
+            step_started_at=_spectrum_step_started,
+            extra={
+                "timing_seconds": _spectrum_result["timing"],
+                "spectrum_shape": _spectrum_result["spectrum_shape"],
+            },
+        )
+        return _spectrum_result["spectrum"], _spectrum_result["spectrum_shape"]
+
     if skip_metrics:
         phase_timings["metrics"] = round(time.monotonic() - t0, 3)
         logger.info("Metrics skipped for profiling")
+        spectrum, spectrum_shape = _await_spectrum()
         segment_times = [
             {"start": float(s.start), "duration": float(s.duration)}
             for s in segments
@@ -2039,6 +2157,9 @@ def run_inference(video_path: str, progress_callback: Callable[[dict], None] | N
         step_started_at=step_started_at,
         extra={"timing_seconds": phase_timings["metrics"], "metrics_skipped": False},
     )
+
+    # Wait for the background spectrum thread before assembling the result.
+    spectrum, spectrum_shape = _await_spectrum()
 
     segment_times = [
         {"start": float(s.start), "duration": float(s.duration)}
