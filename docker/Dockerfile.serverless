@@ -1,21 +1,24 @@
-# Rarámuri — RunPod Serverless variant
-#
-# Extends the canonical inference image with the RunPod SDK and
-# serverless handler entrypoint.  Does NOT change the base model
-# loading, CUDA contract, or cache layout.
+# Rarámuri — RunPod Serverless variant (models baked in)
 #
 # Build:
-#   docker build -f docker/Dockerfile.serverless -t raramuri-serverless .
-#
-# The network volume must be mounted at /models to avoid re-downloading
-# ~30 GB of model weights on every cold start.
+#   docker build -f docker/Dockerfile.serverless \
+#     --secret id=hf_token,env=HF_TOKEN \
+#     -t ghcr.io/chrisvoncsefalvay/raramuri-vanilla-dev:serverless-latest .
 
 FROM ghcr.io/chrisvoncsefalvay/raramuri:latest
 
 RUN python -m pip install --no-cache-dir runpod
 
+COPY docker/preload_models.py /tmp/preload_models.py
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN=$(cat /run/secrets/hf_token) \
+    HF_HOME=/models/hf \
+    TRIBE_CACHE=/models/tribe \
+    MNE_DATA=/models/mne_data \
+    python /tmp/preload_models.py \
+    && rm /tmp/preload_models.py
+
 COPY docker/handler.py /app/handler.py
 
-# Override the CLI entrypoint with the serverless handler.
 ENTRYPOINT []
 CMD ["python", "-u", "/app/handler.py"]
