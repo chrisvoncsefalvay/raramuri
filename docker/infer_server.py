@@ -143,11 +143,15 @@ class InferenceService:
         self._requests_rejected = 0
         self._current_request = None
         self._last_request = None
+        self._last_phase_timings: dict[str, float] = {}
+        self._warmup_timings: dict[str, float] = {}
+        self._warmup_total_seconds: float = 0.0
         self._jobs: dict[str, JobRecord] = {}
         self._supports_progress_callback = self._detect_progress_callback_support(inference_fn)
 
     def warm_models(self) -> None:
         """Prepare runtime patches and warm the cached models once at startup."""
+        warmup_wall_start = time.monotonic()
         with self._lock:
             self._warming = True
             self._warm_error = None
@@ -157,21 +161,34 @@ class InferenceService:
 
             t0 = time.monotonic()
             load_model(reuse=True)
-            logger.info("TRIBEv2 model warmed in %.1fs", time.monotonic() - t0)
+            tribev2_elapsed = round(time.monotonic() - t0, 3)
+            logger.info("TRIBEv2 model warmed in %.1fs", tribev2_elapsed)
 
             t0 = time.monotonic()
             warm_runtime_model_dependencies()
-            logger.info("HF model dependencies warmed in %.1fs", time.monotonic() - t0)
+            hf_deps_elapsed = round(time.monotonic() - t0, 3)
+            logger.info("HF model dependencies warmed in %.1fs", hf_deps_elapsed)
 
+            parakeet_elapsed = 0.0
             transcript_backend = os.environ.get("RARAMURI_TRANSCRIPT_BACKEND", "").strip().lower()
             if transcript_backend == "parakeet":
                 model_name = os.environ.get("RARAMURI_PARAKEET_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
                 t0 = time.monotonic()
                 _get_parakeet_model(model_name)
-                logger.info("Parakeet model warmed in %.1fs", time.monotonic() - t0)
+                parakeet_elapsed = round(time.monotonic() - t0, 3)
+                logger.info("Parakeet model warmed in %.1fs", parakeet_elapsed)
 
+            warmup_total = round(time.monotonic() - warmup_wall_start, 3)
             with self._lock:
                 self._ready = True
+                self._warmup_total_seconds = warmup_total
+                self._warmup_timings = {
+                    "tribev2": tribev2_elapsed,
+                    "hf_dependencies": hf_deps_elapsed,
+                }
+                if parakeet_elapsed > 0:
+                    self._warmup_timings["parakeet"] = parakeet_elapsed
+            logger.info("Total warm-up completed in %.1fs", warmup_total)
         except Exception as exc:
             with self._lock:
                 self._ready = False
@@ -244,6 +261,11 @@ class InferenceService:
         current_request = status.get("current_request") or {}
         last_request = status.get("last_request") or {}
 
+        with self._lock:
+            phase_timings = dict(self._last_phase_timings)
+            warmup_timings = dict(self._warmup_timings)
+            warmup_total = self._warmup_total_seconds
+
         lines = [
             "# HELP raramuri_server_ready Whether the inference server is ready to accept requests.",
             "# TYPE raramuri_server_ready gauge",
@@ -281,10 +303,34 @@ class InferenceService:
             "# HELP raramuri_server_current_request_step_index Index of the current request step.",
             "# TYPE raramuri_server_current_request_step_index gauge",
             f"raramuri_server_current_request_step_index {current_request.get('step_index', 0)}",
+            "# HELP raramuri_server_current_request_step Current inference step name.",
+            "# TYPE raramuri_server_current_request_step gauge",
+            f'raramuri_server_current_request_step{{step="{current_request.get("step", "idle")}"}} 1',
+            "# HELP raramuri_server_current_request_step_elapsed_seconds Elapsed seconds within the current step.",
+            "# TYPE raramuri_server_current_request_step_elapsed_seconds gauge",
+            f"raramuri_server_current_request_step_elapsed_seconds {current_request.get('step_elapsed_seconds') or 0.0}",
             "# HELP raramuri_server_last_request_duration_seconds Duration of the most recent request.",
             "# TYPE raramuri_server_last_request_duration_seconds gauge",
             f"raramuri_server_last_request_duration_seconds {last_request.get('duration_seconds', 0.0)}",
         ]
+
+        # Per-phase timing from the last completed request.
+        if phase_timings:
+            lines.append("# HELP raramuri_last_phase_seconds Duration of each inference phase from the last completed request.")
+            lines.append("# TYPE raramuri_last_phase_seconds gauge")
+            for phase_name, phase_secs in phase_timings.items():
+                if isinstance(phase_secs, (int, float)):
+                    lines.append(f'raramuri_last_phase_seconds{{phase="{phase_name}"}} {phase_secs}')
+
+        # Warm-up timing gauges.
+        lines.append("# HELP raramuri_warmup_total_seconds Total wall-clock time for model warm-up.")
+        lines.append("# TYPE raramuri_warmup_total_seconds gauge")
+        lines.append(f"raramuri_warmup_total_seconds {warmup_total}")
+        if warmup_timings:
+            lines.append("# HELP raramuri_warmup_phase_seconds Duration of each warm-up phase.")
+            lines.append("# TYPE raramuri_warmup_phase_seconds gauge")
+            for phase_name, phase_secs in warmup_timings.items():
+                lines.append(f'raramuri_warmup_phase_seconds{{phase="{phase_name}"}} {phase_secs}')
 
         numeric_process_metrics = {
             "raramuri_server_process_rss_max_mb": process.get("rss_max_mb"),
@@ -548,8 +594,10 @@ class InferenceService:
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_text(json.dumps(result))
             duration = round(time.monotonic() - started_at, 3)
+            phase_timings = (result.get("timing") or {}).get("phases") or {}
             with self._lock:
                 self._requests_completed += 1
+                self._last_phase_timings = dict(phase_timings)
                 self._last_request = {
                     "request_id": request_id,
                     "job_id": job_id,
