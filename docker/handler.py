@@ -31,6 +31,32 @@ _requests_served = 0
 VOLUME_SEARCH_PATHS = ("/runpod-volume", "/workspace")
 
 
+def _restore_symlinks(models_root: Path):
+    """Restore HF cache symlinks that were uploaded as text files via S3.
+
+    The S3 upload script stores symlinks as small text files whose content is
+    the relative link target (e.g. "../../blobs/abc123").  This function finds
+    those files in snapshots/ dirs and converts them back to real symlinks so
+    that transformers' cache resolution works correctly.
+    """
+    restored = 0
+    for snapshots_dir in models_root.rglob("snapshots"):
+        if not snapshots_dir.is_dir():
+            continue
+        for f in snapshots_dir.rglob("*"):
+            if not f.is_file() or f.is_symlink() or f.stat().st_size > 200:
+                continue
+            content = f.read_text().strip()
+            if content.startswith("../../blobs/") or content.startswith("../../../blobs/"):
+                target = f.parent / content
+                if target.exists():
+                    f.unlink()
+                    f.symlink_to(content)
+                    restored += 1
+    if restored:
+        logger.info("Restored %d symlinks in %s", restored, models_root)
+
+
 def _discover_volume_models():
     """Find models on a RunPod network volume and symlink cache dirs.
 
@@ -46,6 +72,8 @@ def _discover_volume_models():
         if marker.is_file():
             models_root = Path(vol_root) / "models"
             logger.info("Found pre-staged models at %s", models_root)
+
+            _restore_symlinks(models_root)
 
             mappings = {
                 "HF_HOME": str(models_root / "hf"),
