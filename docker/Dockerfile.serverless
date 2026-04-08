@@ -1,24 +1,27 @@
-# Rarámuri — RunPod Serverless variant (models baked in)
+# Rarámuri — RunPod Serverless variant (slim: models on network volume)
+#
+# Models live on a RunPod network volume mounted at /models (or /runpod-volume).
+# This image contains only the runtime code + dependencies (~9 GB compressed
+# vs ~23 GB with baked models), so cold-start image pull fits inside
+# RunPod's serverless init timeout.
 #
 # Build:
 #   docker build -f docker/Dockerfile.serverless \
-#     --secret id=hf_token,env=HF_TOKEN \
 #     -t ghcr.io/chrisvoncsefalvay/raramuri-vanilla-dev:serverless-latest .
+#
+# Pre-stage models to a RunPod network volume:
+#   # On a pod with the volume mounted at /runpod-volume:
+#   python /app/preload_to_volume.py /runpod-volume
+#
+# The handler auto-discovers models at /runpod-volume or /models and symlinks
+# the cache dirs so infer.py finds them where it expects.
 
 FROM ghcr.io/chrisvoncsefalvay/raramuri:latest
 
 RUN python -m pip install --no-cache-dir runpod
 
-COPY docker/preload_models.py /tmp/preload_models.py
-RUN --mount=type=secret,id=hf_token \
-    HF_TOKEN=$(cat /run/secrets/hf_token) \
-    HF_HOME=/models/hf \
-    TRIBE_CACHE=/models/tribe \
-    MNE_DATA=/models/mne_data \
-    python /tmp/preload_models.py \
-    && rm /tmp/preload_models.py
-
 COPY docker/handler.py /app/handler.py
+COPY docker/preload_to_volume.py /app/preload_to_volume.py
 
 ENTRYPOINT []
 CMD ["python", "-u", "/app/handler.py"]

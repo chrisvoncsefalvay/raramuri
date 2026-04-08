@@ -1,25 +1,68 @@
-"""RunPod Serverless handler for Rarámuri inference.
+"""RunPod handler for Rarámuri inference — supports serverless AND pod mode.
+
+Serverless mode (default): RunPod dispatches jobs via runpod.serverless.start().
+Pod mode (RARAMURI_POD_MODE=1): Starts a simple HTTP server for interactive testing.
 
 Module-level warm-up loads all models once per worker lifetime.
 Each handler invocation runs inference and returns phase-wise timing
 in Prometheus-compatible format alongside the full result bundle.
 """
 
+import json
 import logging
 import os
+import sys
 import time
-
-import runpod
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── Module-level warm-up ──────────────────────────────────────────
-# RunPod loads this module once per worker. Everything here runs at
-# cold-start time and persists across requests on the same worker.
+# ── Module-level state ──────────────────────────────────────────────
 
 _warmup_timings = {}
-_warmup_wall_start = time.monotonic()
+_warmup_total_seconds = 0.0
+_models_loaded = False
+_requests_served = 0
+
+# ── Network-volume model discovery ──────────────────────────────────
+
+VOLUME_SEARCH_PATHS = ("/runpod-volume", "/workspace")
+
+
+def _discover_volume_models():
+    """Find models on a RunPod network volume and symlink cache dirs.
+
+    RunPod mounts network volumes at /runpod-volume (serverless) or
+    /workspace (pods).  preload_to_volume.py writes models into
+    <mount>/models/{hf,tribe,mne_data} with a .ready marker.
+
+    If a volume is found, we point HF_HOME / TRIBE_CACHE / MNE_DATA
+    at the volume paths so infer.py picks them up without downloading.
+    """
+    for vol_root in VOLUME_SEARCH_PATHS:
+        marker = Path(vol_root) / "models" / ".ready"
+        if marker.is_file():
+            models_root = Path(vol_root) / "models"
+            logger.info("Found pre-staged models at %s", models_root)
+
+            mappings = {
+                "HF_HOME": str(models_root / "hf"),
+                "TRIBE_CACHE": str(models_root / "tribe"),
+                "MNE_DATA": str(models_root / "mne_data"),
+            }
+            for env_var, path in mappings.items():
+                if Path(path).is_dir():
+                    os.environ[env_var] = path
+                    logger.info("  %s -> %s", env_var, path)
+            return True
+
+    logger.info("No pre-staged volume models found; will download on first use")
+    return False
+
+
+# ── Lazy model loading ──────────────────────────────────────────────
 
 from infer import (
     _get_parakeet_model,
@@ -34,34 +77,50 @@ from infer import (
     normalize_time_range,
 )
 
-log_runtime_contract()
-ensure_runtime_prerequisites()
-patch_runtime_extractors()
 
-t0 = time.monotonic()
-load_model(reuse=True)
-_warmup_timings["tribev2"] = round(time.monotonic() - t0, 3)
-logger.info("TRIBEv2 model warmed in %.1fs", _warmup_timings["tribev2"])
+def _lazy_init():
+    """Load all models on first request, not at module level.
 
-t0 = time.monotonic()
-warm_runtime_model_dependencies()
-_warmup_timings["hf_dependencies"] = round(time.monotonic() - t0, 3)
-logger.info("HF model dependencies warmed in %.1fs", _warmup_timings["hf_dependencies"])
+    RunPod's serverless health check has a tight init timeout. By deferring
+    heavy model loading to the first handler invocation, the worker reports
+    ready immediately and the models load while processing the first job.
+    """
+    global _models_loaded, _warmup_timings, _warmup_total_seconds
+    if _models_loaded:
+        return
 
-transcript_backend = os.environ.get("RARAMURI_TRANSCRIPT_BACKEND", "").strip().lower()
-if transcript_backend == "parakeet":
-    model_name = os.environ.get("RARAMURI_PARAKEET_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
+    wall_start = time.monotonic()
+
+    _discover_volume_models()
+
+    log_runtime_contract()
+    ensure_runtime_prerequisites()
+    patch_runtime_extractors()
+
     t0 = time.monotonic()
-    _get_parakeet_model(model_name)
-    _warmup_timings["parakeet"] = round(time.monotonic() - t0, 3)
-    logger.info("Parakeet model warmed in %.1fs", _warmup_timings["parakeet"])
+    load_model(reuse=True)
+    _warmup_timings["tribev2"] = round(time.monotonic() - t0, 3)
+    logger.info("TRIBEv2 model warmed in %.1fs", _warmup_timings["tribev2"])
 
-_warmup_total_seconds = round(time.monotonic() - _warmup_wall_start, 3)
-logger.info("RunPod worker warm-up complete in %.1fs: %s", _warmup_total_seconds, _warmup_timings)
+    t0 = time.monotonic()
+    warm_runtime_model_dependencies()
+    _warmup_timings["hf_dependencies"] = round(time.monotonic() - t0, 3)
+    logger.info("HF model dependencies warmed in %.1fs", _warmup_timings["hf_dependencies"])
 
-# Track whether this worker has served a request (warm vs cold inference).
-_requests_served = 0
+    transcript_backend = os.environ.get("RARAMURI_TRANSCRIPT_BACKEND", "").strip().lower()
+    if transcript_backend == "parakeet":
+        model_name = os.environ.get("RARAMURI_PARAKEET_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
+        t0 = time.monotonic()
+        _get_parakeet_model(model_name)
+        _warmup_timings["parakeet"] = round(time.monotonic() - t0, 3)
+        logger.info("Parakeet model warmed in %.1fs", _warmup_timings["parakeet"])
 
+    _warmup_total_seconds = round(time.monotonic() - wall_start, 3)
+    logger.info("RunPod worker warm-up complete in %.1fs: %s", _warmup_total_seconds, _warmup_timings)
+    _models_loaded = True
+
+
+# ── Prometheus metrics ──────────────────────────────────────────────
 
 def _format_prometheus_metrics(
     phase_timings: dict,
@@ -106,6 +165,8 @@ def _format_prometheus_metrics(
     return "\n".join(lines) + "\n"
 
 
+# ── Core inference handler ──────────────────────────────────────────
+
 def handler(job):
     """RunPod serverless handler.
 
@@ -125,6 +186,8 @@ def handler(job):
         - shape, segments, event_types, etc.
     """
     global _requests_served
+
+    _lazy_init()
 
     inp = job["input"]
     video_url = inp.get("video_url")
@@ -216,4 +279,80 @@ def handler(job):
             shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
-runpod.serverless.start({"handler": handler})
+# ── Pod-mode HTTP server ────────────────────────────────────────────
+
+class _PodHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler for pod-mode testing."""
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "ok",
+                "models_loaded": _models_loaded,
+                "requests_served": _requests_served,
+            }).encode())
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Raramuri pod mode. POST /run with {\"input\": {...}} to run inference.\n")
+
+    def do_POST(self):
+        if self.path != "/run":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        try:
+            job = json.loads(body)
+        except json.JSONDecodeError as exc:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"Invalid JSON: {exc}"}).encode())
+            return
+
+        logger.info("Pod-mode inference request: %s", {k: v for k, v in job.get("input", {}).items() if k != "include_predictions"})
+        result = handler(job)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(result, default=str).encode())
+
+    def log_message(self, format, *args):
+        logger.info(format, *args)
+
+
+def _run_pod_server():
+    """Start an HTTP server for pod-mode testing on port 8888."""
+    port = int(os.environ.get("RARAMURI_POD_PORT", "8888"))
+    server = HTTPServer(("0.0.0.0", port), _PodHandler)
+    logger.info("Pod mode: HTTP server on port %d (GET /health, POST /run)", port)
+    logger.info("To run inference: curl -X POST http://localhost:%d/run -d '{\"input\": {\"video_url\": \"...\"}}'", port)
+    server.serve_forever()
+
+
+# ── Entrypoint ──────────────────────────────────────────────────────
+
+def _is_pod_mode() -> bool:
+    """Detect whether we're running in a RunPod pod (not serverless)."""
+    if os.environ.get("RARAMURI_POD_MODE", "").strip() == "1":
+        return True
+    # RunPod serverless sets RUNPOD_ENDPOINT_ID; pods don't.
+    if not os.environ.get("RUNPOD_ENDPOINT_ID") and os.environ.get("RUNPOD_POD_ID"):
+        return True
+    return False
+
+
+if _is_pod_mode():
+    logger.info("Detected pod mode — starting HTTP server instead of serverless handler")
+    _run_pod_server()
+else:
+    import runpod
+    runpod.serverless.start({"handler": handler})
