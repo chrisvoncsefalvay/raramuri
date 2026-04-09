@@ -1848,9 +1848,6 @@ def run_inference(video_path: str, progress_callback: Callable[[dict], None] | N
         step_started_at=step_started_at,
     )
     try:
-        # Flush any deferred CUDA errors from prior steps so they don't surface
-        # as opaque empty-message RuntimeErrors during predict.
-        torch.cuda.synchronize()
         with profiled_phase('predict'):
             preds, segments = model.predict(events=events, verbose=True)
             preds = preds.astype(np.float32)
