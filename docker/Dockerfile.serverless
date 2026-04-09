@@ -18,7 +18,7 @@
 
 FROM ghcr.io/chrisvoncsefalvay/raramuri:latest
 
-RUN python -m pip install --no-cache-dir runpod
+RUN python -m pip install --no-cache-dir runpod torchao
 
 COPY docker/handler.py /app/handler.py
 COPY docker/preload_to_volume.py /app/preload_to_volume.py
