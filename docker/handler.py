@@ -215,7 +215,8 @@ def _split_chunk(video_path: str, start: float, duration: float, output_path: st
     """Extract a chunk from a video with ffmpeg."""
     subprocess.run(
         ["ffmpeg", "-y", "-ss", str(start), "-i", video_path,
-         "-t", str(duration), "-c", "copy", "-avoid_negative_ts", "1", output_path],
+         "-t", str(duration), "-c:v", "libx264", "-preset", "ultrafast",
+         "-c:a", "aac", "-avoid_negative_ts", "1", output_path],
         capture_output=True, check=True,
     )
 
