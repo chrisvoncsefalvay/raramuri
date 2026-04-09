@@ -357,30 +357,11 @@ def handler(job):
                    "chunk_range": [round(chunk_start, 2), round(chunk_start + chunk_dur, 2)],
                    "total_chunks": total_chunks}
 
-            # Run inference in a background thread for real-time progress.
-            progress_queue = queue.Queue()
-            thread = threading.Thread(
-                target=_run_inference_threaded,
-                args=(infer_path, progress_queue),
-                daemon=True,
-            )
-            thread.start()
-
-            # Yield progress updates in real time as inference runs.
-            terminal = None
-            while terminal is None:
-                updates, terminal = _drain_progress(progress_queue, timeout=1.0)
-                for update in updates:
-                    update["chunk_index"] = chunk_idx
-                    update["total_chunks"] = total_chunks
-                    yield update
-
-            thread.join(timeout=5)
-
-            if terminal[0] == "ERROR":
-                raise terminal[1]
-
-            chunk_result = terminal[1]
+            # Run inference directly in the generator (no threading).
+            # Threading caused CUDA errors in model.predict() — TRIBE v2
+            # internals are not thread-safe.  Sub-step progress is sacrificed
+            # but chunk-level streaming still works.
+            chunk_result = run_inference(video_path=infer_path)
 
             # Offset captions/segments timestamps to absolute position.
             if chunk_start > 0:
@@ -472,8 +453,11 @@ def handler(job):
         yield final
 
     except Exception as exc:
+        import traceback
         logger.exception("Inference failed")
-        yield {"type": "error", "error": str(exc)}
+        err_msg = f"{type(exc).__name__}: {exc}" if str(exc) else f"{type(exc).__name__}: {exc!r}"
+        err_tb = traceback.format_exc()
+        yield {"type": "error", "error": err_msg, "traceback": err_tb}
     finally:
         if cleanup_dir is not None:
             import shutil
