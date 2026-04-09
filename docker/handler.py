@@ -239,6 +239,11 @@ def _run_inference_threaded(video_path, progress_queue):
         result = run_inference(video_path, progress_callback=progress_callback)
         progress_queue.put(("DONE", result))
     except Exception as exc:
+        import traceback
+        # Capture the full traceback in the thread — it's lost after re-raise
+        # in the main thread.  Attach it as an attribute for the error handler.
+        exc.__thread_traceback__ = traceback.format_exc()
+        logger.exception("Inference failed in worker thread")
         progress_queue.put(("ERROR", exc))
 
 
@@ -357,11 +362,30 @@ def handler(job):
                    "chunk_range": [round(chunk_start, 2), round(chunk_start + chunk_dur, 2)],
                    "total_chunks": total_chunks}
 
-            # Run inference directly in the generator (no threading).
-            # Threading caused CUDA errors in model.predict() — TRIBE v2
-            # internals are not thread-safe.  Sub-step progress is sacrificed
-            # but chunk-level streaming still works.
-            chunk_result = run_inference(video_path=infer_path)
+            # Run inference in a background thread for real-time progress.
+            progress_queue = queue.Queue()
+            thread = threading.Thread(
+                target=_run_inference_threaded,
+                args=(infer_path, progress_queue),
+                daemon=True,
+            )
+            thread.start()
+
+            # Yield progress updates in real time as inference runs.
+            terminal = None
+            while terminal is None:
+                updates, terminal = _drain_progress(progress_queue, timeout=1.0)
+                for update in updates:
+                    update["chunk_index"] = chunk_idx
+                    update["total_chunks"] = total_chunks
+                    yield update
+
+            thread.join(timeout=5)
+
+            if terminal[0] == "ERROR":
+                raise terminal[1]
+
+            chunk_result = terminal[1]
 
             # Offset captions/segments timestamps to absolute position.
             if chunk_start > 0:
@@ -456,7 +480,8 @@ def handler(job):
         import traceback
         logger.exception("Inference failed")
         err_msg = f"{type(exc).__name__}: {exc}" if str(exc) else f"{type(exc).__name__}: {exc!r}"
-        err_tb = traceback.format_exc()
+        # Prefer thread-captured traceback (has the real stack) over re-raise tb.
+        err_tb = getattr(exc, "__thread_traceback__", None) or traceback.format_exc()
         yield {"type": "error", "error": err_msg, "traceback": err_tb}
     finally:
         if cleanup_dir is not None:
