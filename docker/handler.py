@@ -239,11 +239,6 @@ def _run_inference_threaded(video_path, progress_queue):
         result = run_inference(video_path, progress_callback=progress_callback)
         progress_queue.put(("DONE", result))
     except Exception as exc:
-        import traceback
-        # Capture the full traceback in the thread — it's lost after re-raise
-        # in the main thread.  Attach it as an attribute for the error handler.
-        exc.__thread_traceback__ = traceback.format_exc()
-        logger.exception("Inference failed in worker thread")
         progress_queue.put(("ERROR", exc))
 
 
@@ -477,12 +472,8 @@ def handler(job):
         yield final
 
     except Exception as exc:
-        import traceback
         logger.exception("Inference failed")
-        err_msg = f"{type(exc).__name__}: {exc}" if str(exc) else f"{type(exc).__name__}: {exc!r}"
-        # Prefer thread-captured traceback (has the real stack) over re-raise tb.
-        err_tb = getattr(exc, "__thread_traceback__", None) or traceback.format_exc()
-        yield {"type": "error", "error": err_msg, "traceback": err_tb}
+        yield {"type": "error", "error": str(exc)}
     finally:
         if cleanup_dir is not None:
             import shutil
