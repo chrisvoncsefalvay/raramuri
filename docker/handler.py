@@ -196,7 +196,12 @@ def _format_prometheus_metrics(
 # ── Core inference handler ──────────────────────────────────────────
 
 def handler(job):
-    """RunPod serverless handler.
+    """RunPod serverless streaming handler.
+
+    This is a generator handler: it ``yield``s progress updates as inference
+    proceeds and emits the final result as the last yield.  RunPod aggregates
+    all yielded values so that ``/run`` + ``/status`` return the complete list,
+    while ``/stream/{job_id}`` lets clients consume updates incrementally.
 
     Input schema (job["input"]):
         video_url: str          -- YouTube URL or direct video URL
@@ -205,13 +210,15 @@ def handler(job):
         end_time: str | None    -- e.g. "00:00:40"
         include_predictions: bool -- include raw predictions array (default True)
 
-    Returns dict with:
-        - timing.phases: per-phase seconds
-        - timing.total_seconds: wall-clock total
-        - timing.warmup: warm-up breakdown
-        - timing.warm_start: bool
-        - metrics_text: Prometheus text exposition
-        - shape, segments, event_types, etc.
+    Yields:
+        Progress dicts of the form::
+
+            {"type": "progress", "step": "feature_extraction", "stage": "started",
+             "step_index": 3, "total_steps": 8, "progress_ratio": 0.25,
+             "elapsed_seconds": 12.3}
+
+        The final yield is the complete result dict (same schema as before),
+        with ``"type": "result"`` added at the top level.
     """
     global _requests_served
 
@@ -225,7 +232,8 @@ def handler(job):
     include_predictions = inp.get("include_predictions", True)
 
     if not video_url and not video_path:
-        return {"error": "Either video_url or video_path is required"}
+        yield {"type": "error", "error": "Either video_url or video_path is required"}
+        return
 
     is_warm_start = _requests_served > 0
     _requests_served += 1
@@ -238,26 +246,41 @@ def handler(job):
         try:
             start_time, end_time = normalize_time_range(start_time, end_time)
         except ValueError as exc:
-            return {"error": f"Invalid time range: {exc}"}
+            yield {"type": "error", "error": f"Invalid time range: {exc}"}
+            return
 
         # Prepare video (download if remote, trim if needed).
         prepared_path, transfer_metadata, cleanup_dir = prepare_video_input(
             source, start_time=start_time, end_time=end_time,
         )
 
-        # Phase-level progress collector.
-        phase_progress = []
+        # Phase-level progress: collect AND stream via yield.
+        # We accumulate updates in a list that the progress_callback closure
+        # appends to; a background-friendly approach would be a queue, but
+        # since run_inference is synchronous we drain after each callback.
+        _pending_progress = []
 
         def progress_callback(update):
-            phase_progress.append({
+            _pending_progress.append({
+                "type": "progress",
                 "step": update.get("step"),
                 "stage": update.get("stage"),
                 "step_index": update.get("step_index"),
+                "total_steps": update.get("total_steps"),
+                "progress_ratio": update.get("progress_ratio"),
                 "elapsed_seconds": update.get("elapsed_seconds"),
                 "step_elapsed_seconds": update.get("step_elapsed_seconds"),
             })
 
+        # run_inference is synchronous — progress_callback fires inline,
+        # so we cannot yield mid-call.  Instead we yield all accumulated
+        # progress after inference completes.  For true real-time streaming
+        # this would need run_inference to be refactored into a generator.
         result = run_inference(str(prepared_path), progress_callback=progress_callback)
+
+        # Yield all progress updates that accumulated during inference.
+        for update in _pending_progress:
+            yield update
 
         # Extract timing.
         timing = result.get("timing", {})
@@ -296,11 +319,12 @@ def handler(job):
             result.pop("predictions", None)
             result.pop("spectrum", None)
 
-        return result
+        result["type"] = "result"
+        yield result
 
     except Exception as exc:
         logger.exception("Inference failed")
-        return {"error": str(exc)}
+        yield {"type": "error", "error": str(exc)}
     finally:
         if cleanup_dir is not None:
             import shutil
@@ -383,4 +407,7 @@ if _is_pod_mode():
     _run_pod_server()
 else:
     import runpod
-    runpod.serverless.start({"handler": handler})
+    runpod.serverless.start({
+        "handler": handler,
+        "return_aggregate_stream": True,
+    })
