@@ -239,7 +239,12 @@ def _run_inference_threaded(video_path, progress_queue):
         result = run_inference(video_path, progress_callback=progress_callback)
         progress_queue.put(("DONE", result))
     except Exception as exc:
-        progress_queue.put(("ERROR", exc))
+        # Build a rich error BEFORE putting on queue — the thread traceback
+        # is lost once control returns to the main thread.
+        import traceback as _tb
+        detail = f"{type(exc).__name__}: {exc!r}\n{''.join(_tb.format_exception(exc))}"
+        wrapped = RuntimeError(detail)
+        progress_queue.put(("ERROR", wrapped))
 
 
 def _drain_progress(progress_queue, timeout=0.1):
