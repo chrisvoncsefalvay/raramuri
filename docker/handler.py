@@ -11,7 +11,10 @@ in Prometheus-compatible format alongside the full result bundle.
 import json
 import logging
 import os
+import queue
+import subprocess
 import sys
+import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -193,15 +196,74 @@ def _format_prometheus_metrics(
     return "\n".join(lines) + "\n"
 
 
+# ── Helpers ────────────────────────────────────────────────────────
+
+_CHUNK_SECONDS = int(os.environ.get("RARAMURI_CHUNK_SECONDS", "20"))
+
+
+def _probe_duration(video_path: str) -> float:
+    """Get video duration in seconds via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+        capture_output=True, text=True,
+    )
+    return float(result.stdout.strip())
+
+
+def _split_chunk(video_path: str, start: float, duration: float, output_path: str):
+    """Extract a chunk from a video with ffmpeg."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-ss", str(start), "-i", video_path,
+         "-t", str(duration), "-c", "copy", "-avoid_negative_ts", "1", output_path],
+        capture_output=True, check=True,
+    )
+
+
+def _run_inference_threaded(video_path, progress_queue):
+    """Run inference in a background thread, pushing progress to a queue."""
+    def progress_callback(update):
+        progress_queue.put({
+            "type": "progress",
+            "step": update.get("step"),
+            "stage": update.get("stage"),
+            "step_index": update.get("step_index"),
+            "total_steps": update.get("total_steps"),
+            "progress_ratio": update.get("progress_ratio"),
+            "elapsed_seconds": update.get("elapsed_seconds"),
+            "step_elapsed_seconds": update.get("step_elapsed_seconds"),
+        })
+
+    try:
+        result = run_inference(video_path, progress_callback=progress_callback)
+        progress_queue.put(("DONE", result))
+    except Exception as exc:
+        progress_queue.put(("ERROR", exc))
+
+
+def _drain_progress(progress_queue, timeout=0.1):
+    """Drain all pending progress updates from the queue."""
+    updates = []
+    while True:
+        try:
+            item = progress_queue.get(timeout=timeout)
+            if isinstance(item, tuple):
+                return updates, item  # terminal signal
+            updates.append(item)
+        except queue.Empty:
+            return updates, None
+
+
 # ── Core inference handler ──────────────────────────────────────────
 
 def handler(job):
-    """RunPod serverless streaming handler.
+    """RunPod serverless streaming handler with chunked output.
 
-    This is a generator handler: it ``yield``s progress updates as inference
-    proceeds and emits the final result as the last yield.  RunPod aggregates
-    all yielded values so that ``/run`` + ``/status`` return the complete list,
-    while ``/stream/{job_id}`` lets clients consume updates incrementally.
+    Streams real-time progress updates via a background thread and emits
+    results in chunks (default 20s) so clients receive partial output as
+    each chunk completes.  RunPod aggregates all yielded values so that
+    ``/run`` + ``/status`` still return everything, while ``/stream/{job_id}``
+    lets clients consume updates incrementally.
 
     Input schema (job["input"]):
         video_url: str          -- YouTube URL or direct video URL
@@ -209,16 +271,12 @@ def handler(job):
         start_time: str | None  -- e.g. "00:00:10"
         end_time: str | None    -- e.g. "00:00:40"
         include_predictions: bool -- include raw predictions array (default True)
+        chunk_seconds: int | None -- chunk size in seconds (default: env RARAMURI_CHUNK_SECONDS or 20)
 
     Yields:
-        Progress dicts of the form::
-
-            {"type": "progress", "step": "feature_extraction", "stage": "started",
-             "step_index": 3, "total_steps": 8, "progress_ratio": 0.25,
-             "elapsed_seconds": 12.3}
-
-        The final yield is the complete result dict (same schema as before),
-        with ``"type": "result"`` added at the top level.
+        ``{"type": "progress", ...}`` — real-time phase updates during each chunk.
+        ``{"type": "chunk_result", "chunk_index": 0, "chunk_range": [0, 20], ...}`` — per-chunk results.
+        ``{"type": "result", ...}`` — final aggregated result (last yield).
     """
     global _requests_served
 
@@ -230,6 +288,7 @@ def handler(job):
     start_time = inp.get("start_time")
     end_time = inp.get("end_time")
     include_predictions = inp.get("include_predictions", True)
+    chunk_seconds = inp.get("chunk_seconds", _CHUNK_SECONDS)
 
     if not video_url and not video_path:
         yield {"type": "error", "error": "Either video_url or video_path is required"}
@@ -254,38 +313,137 @@ def handler(job):
             source, start_time=start_time, end_time=end_time,
         )
 
-        # Phase-level progress: collect AND stream via yield.
-        # We accumulate updates in a list that the progress_callback closure
-        # appends to; a background-friendly approach would be a queue, but
-        # since run_inference is synchronous we drain after each callback.
-        _pending_progress = []
+        yield {"type": "progress", "step": "video_prepared", "stage": "completed",
+               "transfer": transfer_metadata}
 
-        def progress_callback(update):
-            _pending_progress.append({
-                "type": "progress",
-                "step": update.get("step"),
-                "stage": update.get("stage"),
-                "step_index": update.get("step_index"),
-                "total_steps": update.get("total_steps"),
-                "progress_ratio": update.get("progress_ratio"),
-                "elapsed_seconds": update.get("elapsed_seconds"),
-                "step_elapsed_seconds": update.get("step_elapsed_seconds"),
-            })
+        # Determine chunking.
+        duration = _probe_duration(str(prepared_path))
+        if chunk_seconds and chunk_seconds > 0 and duration > chunk_seconds * 1.5:
+            # Split into chunks — worth it only if video is >1.5x chunk size.
+            chunks = []
+            t = 0.0
+            while t < duration:
+                chunk_dur = min(chunk_seconds, duration - t)
+                chunks.append((t, chunk_dur))
+                t += chunk_dur
+        else:
+            # Single chunk — the whole video.
+            chunks = [(0.0, duration)]
 
-        # run_inference is synchronous — progress_callback fires inline,
-        # so we cannot yield mid-call.  Instead we yield all accumulated
-        # progress after inference completes.  For true real-time streaming
-        # this would need run_inference to be refactored into a generator.
-        result = run_inference(str(prepared_path), progress_callback=progress_callback)
+        total_chunks = len(chunks)
+        yield {"type": "progress", "step": "chunking", "stage": "completed",
+               "duration": round(duration, 2), "total_chunks": total_chunks,
+               "chunk_seconds": chunk_seconds}
 
-        # Yield all progress updates that accumulated during inference.
-        for update in _pending_progress:
-            yield update
+        wall_start = time.monotonic()
+        all_chunk_results = []
 
-        # Extract timing.
-        timing = result.get("timing", {})
-        phase_timings = timing.get("phases", {})
-        total_seconds = timing.get("total_seconds", 0.0)
+        for chunk_idx, (chunk_start, chunk_dur) in enumerate(chunks):
+            # Prepare chunk video file.
+            if total_chunks > 1:
+                import tempfile
+                chunk_path = Path(tempfile.mktemp(
+                    prefix=f"chunk{chunk_idx}_", suffix=".mp4",
+                    dir=cleanup_dir or "/tmp",
+                ))
+                _split_chunk(str(prepared_path), chunk_start, chunk_dur, str(chunk_path))
+                infer_path = str(chunk_path)
+            else:
+                infer_path = str(prepared_path)
+
+            yield {"type": "progress", "step": "inference",
+                   "stage": "started", "chunk_index": chunk_idx,
+                   "chunk_range": [round(chunk_start, 2), round(chunk_start + chunk_dur, 2)],
+                   "total_chunks": total_chunks}
+
+            # Run inference in a background thread for real-time progress.
+            progress_queue = queue.Queue()
+            thread = threading.Thread(
+                target=_run_inference_threaded,
+                args=(infer_path, progress_queue),
+                daemon=True,
+            )
+            thread.start()
+
+            # Yield progress updates in real time as inference runs.
+            terminal = None
+            while terminal is None:
+                updates, terminal = _drain_progress(progress_queue, timeout=1.0)
+                for update in updates:
+                    update["chunk_index"] = chunk_idx
+                    update["total_chunks"] = total_chunks
+                    yield update
+
+            thread.join(timeout=5)
+
+            if terminal[0] == "ERROR":
+                raise terminal[1]
+
+            chunk_result = terminal[1]
+
+            # Offset captions/segments timestamps to absolute position.
+            if chunk_start > 0:
+                for caption in chunk_result.get("captions", []):
+                    caption["start"] = round(caption["start"] + chunk_start, 3)
+                    caption["end"] = round(caption["end"] + chunk_start, 3)
+                for seg in chunk_result.get("segments", []):
+                    seg["start"] = round(seg["start"] + chunk_start, 3)
+
+            # Emit chunk result.
+            chunk_output = {
+                "type": "chunk_result",
+                "chunk_index": chunk_idx,
+                "chunk_range": [round(chunk_start, 2), round(chunk_start + chunk_dur, 2)],
+                "total_chunks": total_chunks,
+                "captions": chunk_result.get("captions", []),
+                "event_types": chunk_result.get("event_types", {}),
+                "has_text": chunk_result.get("has_text", False),
+                "timing": chunk_result.get("timing", {}),
+            }
+            if include_predictions:
+                chunk_output["predictions"] = chunk_result.get("predictions")
+                chunk_output["spectrum"] = chunk_result.get("spectrum")
+            # Include metrics only for single-chunk or last chunk.
+            if total_chunks == 1 or chunk_idx == total_chunks - 1:
+                chunk_output["metrics"] = chunk_result.get("metrics")
+
+            yield chunk_output
+            all_chunk_results.append(chunk_result)
+
+        # Build final aggregated result.
+        total_seconds = round(time.monotonic() - wall_start, 3)
+        if total_chunks == 1:
+            final = all_chunk_results[0]
+        else:
+            # Merge chunk results.
+            final = {
+                "captions": [],
+                "event_types": {},
+                "has_text": False,
+                "timing": {"phases": {}, "total_seconds": total_seconds},
+                "metrics": all_chunk_results[-1].get("metrics"),
+            }
+            if include_predictions:
+                final["predictions"] = []
+            for cr in all_chunk_results:
+                final["captions"].extend(cr.get("captions", []))
+                final["has_text"] = final["has_text"] or cr.get("has_text", False)
+                if include_predictions and cr.get("predictions"):
+                    final["predictions"].extend(cr["predictions"])
+                for et, count in cr.get("event_types", {}).items():
+                    final["event_types"][et] = final["event_types"].get(et, 0) + count
+
+        # Enrich timing block.
+        final.setdefault("timing", {})
+        final["timing"]["total_seconds"] = total_seconds
+        final["timing"]["warmup"] = {
+            "total_seconds": _warmup_total_seconds,
+            "phases": _warmup_timings,
+        }
+        final["timing"]["warm_start"] = is_warm_start
+        final["timing"]["transfer"] = transfer_metadata
+        final["timing"]["total_chunks"] = total_chunks
+        final["timing"]["chunk_seconds"] = chunk_seconds
 
         # GPU snapshot.
         gpu_snapshot = None
@@ -295,8 +453,8 @@ def handler(job):
         except Exception:
             pass
 
-        # Build Prometheus text.
-        metrics_text = _format_prometheus_metrics(
+        phase_timings = final["timing"].get("phases", {})
+        final["metrics_text"] = _format_prometheus_metrics(
             phase_timings=phase_timings,
             warmup_timings=_warmup_timings,
             warmup_total=_warmup_total_seconds,
@@ -305,22 +463,12 @@ def handler(job):
             gpu_snapshot=gpu_snapshot,
         )
 
-        # Enrich timing block.
-        result["timing"]["warmup"] = {
-            "total_seconds": _warmup_total_seconds,
-            "phases": _warmup_timings,
-        }
-        result["timing"]["warm_start"] = is_warm_start
-        result["timing"]["transfer"] = transfer_metadata
-        result["metrics_text"] = metrics_text
-
-        # Optionally strip the large predictions array for lighter responses.
         if not include_predictions:
-            result.pop("predictions", None)
-            result.pop("spectrum", None)
+            final.pop("predictions", None)
+            final.pop("spectrum", None)
 
-        result["type"] = "result"
-        yield result
+        final["type"] = "result"
+        yield final
 
     except Exception as exc:
         logger.exception("Inference failed")

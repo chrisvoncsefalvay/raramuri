@@ -17,7 +17,8 @@ All requests require the header `Authorization: Bearer {RUNPOD_API_KEY}`.
     "video_url": "https://www.youtube.com/watch?v=...",
     "start_time": "00:00:10",
     "end_time": "00:00:40",
-    "include_predictions": true
+    "include_predictions": true,
+    "chunk_seconds": 20
   }
 }
 ```
@@ -29,8 +30,17 @@ All requests require the header `Authorization: Bearer {RUNPOD_API_KEY}`.
 | `start_time` | string | no | Clip start, e.g. `"00:00:10"` |
 | `end_time` | string | no | Clip end, e.g. `"00:00:40"` |
 | `include_predictions` | bool | no | Include raw predictions array (default `true`) |
+| `chunk_seconds` | int | no | Chunk size in seconds (default `20`, env `RARAMURI_CHUNK_SECONDS`) |
 
 \* One of `video_url` or `video_path` is required.
+
+## Chunked inference
+
+For videos longer than 1.5x the chunk size, the handler splits the video into
+chunks and runs inference on each independently. Results are streamed per chunk
+so clients can display partial output before the full video is processed.
+
+Set `chunk_seconds` to `0` or a value larger than the video to disable chunking.
 
 ## Streaming progress
 
@@ -110,9 +120,11 @@ if data["status"] == "COMPLETED":
     result = data["output"][-1]
 ```
 
-## Progress update schema
+## Streamed message types
 
-Each progress update has:
+### `progress`
+
+Real-time phase updates, streamed as inference runs (via background thread):
 
 ```json
 {
@@ -123,12 +135,36 @@ Each progress update has:
   "total_steps": 8,
   "progress_ratio": 0.25,
   "elapsed_seconds": 12.3,
-  "step_elapsed_seconds": 1.2
+  "step_elapsed_seconds": 1.2,
+  "chunk_index": 0,
+  "total_chunks": 3
 }
 ```
 
 Pipeline steps in order: `model_load`, `transcription`, `event_construction`,
 `feature_extraction`, `prediction`, `metrics`, `correlation`, `roi`.
+
+### `chunk_result`
+
+Emitted after each chunk completes. Contains captions, event types, and timing
+for that chunk. Timestamps are offset to absolute video position.
+
+```json
+{
+  "type": "chunk_result",
+  "chunk_index": 0,
+  "chunk_range": [0.0, 20.0],
+  "total_chunks": 3,
+  "captions": [{"start": 1.2, "end": 3.4, "text": "Hello world"}],
+  "event_types": {"Word": 12, "Sentence": 2},
+  "has_text": true,
+  "timing": {"phases": {"model_load": 0.001, "prediction": 8.2}, "total_seconds": 15.3}
+}
+```
+
+### `result`
+
+Final aggregated result (last yield). Same schema as before, merging all chunks.
 
 ## Result schema
 
